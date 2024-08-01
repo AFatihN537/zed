@@ -27,7 +27,7 @@ jobs:
       run: rustc --version
 
     - name: Build and Run the Rust project
-      run: cargo run --release
+      run: cargo build --release
 
     - name: Upload build artifacts
       uses: actions/upload-artifact@v2
