@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use util::serde::default_true;
 
 use anyhow::{bail, Context};
 use collections::{HashMap, HashSet};
@@ -57,6 +58,12 @@ pub struct TaskTemplate {
     /// Which shell to use when spawning the task.
     #[serde(default)]
     pub shell: Shell,
+    /// Whether to show the task line in the task output.
+    #[serde(default = "default_true")]
+    pub show_summary: bool,
+    /// Whether to show the command line in the task output.
+    #[serde(default = "default_true")]
+    pub show_command: bool,
 }
 
 /// What to do with the terminal pane and tab, after the command was started.
@@ -66,6 +73,8 @@ pub enum RevealStrategy {
     /// Always show the terminal pane, add and focus the corresponding task's tab in it.
     #[default]
     Always,
+    /// Always show the terminal pane, add the task's tab in it, but don't focus it.
+    NoFocus,
     /// Do not change terminal pane focus, but still add/reuse the task's tab there.
     Never,
 }
@@ -174,7 +183,7 @@ impl TaskTemplate {
             &mut substituted_variables,
         )?;
 
-        let task_hash = to_hex_hash(&self)
+        let task_hash = to_hex_hash(self)
             .context("hashing task template")
             .log_err()?;
         let variables_hash = to_hex_hash(&task_variables)
@@ -228,6 +237,8 @@ impl TaskTemplate {
                 reveal: self.reveal,
                 hide: self.hide,
                 shell: self.shell.clone(),
+                show_summary: self.show_summary,
+                show_command: self.show_command,
             }),
         })
     }
@@ -319,13 +330,13 @@ fn substitute_all_template_variables_in_map(
     let mut new_map: HashMap<String, String> = Default::default();
     for (key, value) in keys_and_values {
         let new_value = substitute_all_template_variables_in_str(
-            &value,
+            value,
             task_variables,
             variable_names,
             substituted_variables,
         )?;
         let new_key = substitute_all_template_variables_in_str(
-            &key,
+            key,
             task_variables,
             variable_names,
             substituted_variables,

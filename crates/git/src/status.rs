@@ -2,7 +2,7 @@ use crate::repository::{GitFileStatus, RepoPath};
 use anyhow::{anyhow, Result};
 use std::{
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::Arc,
 };
 
@@ -15,15 +15,9 @@ impl GitStatus {
     pub(crate) fn new(
         git_binary: &Path,
         working_directory: &Path,
-        mut path_prefix: &Path,
+        path_prefixes: &[PathBuf],
     ) -> Result<Self> {
-        let mut child = Command::new(git_binary);
-
-        if path_prefix == Path::new("") {
-            path_prefix = Path::new(".");
-        }
-
-        child
+        let child = util::command::new_std_command(git_binary)
             .current_dir(working_directory)
             .args([
                 "--no-optional-locks",
@@ -32,18 +26,16 @@ impl GitStatus {
                 "--untracked-files=all",
                 "-z",
             ])
-            .arg(path_prefix)
+            .args(path_prefixes.iter().map(|path_prefix| {
+                if *path_prefix == Path::new("") {
+                    Path::new(".")
+                } else {
+                    path_prefix
+                }
+            }))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            child.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
-        }
-
-        let child = child
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| anyhow!("Failed to start git status process: {}", e))?;
 
@@ -55,7 +47,6 @@ impl GitStatus {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow!("git status process failed: {}", stderr));
         }
-
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut entries = stdout
             .split('\0')

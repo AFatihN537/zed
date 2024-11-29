@@ -11,12 +11,12 @@ use client::telemetry::Telemetry;
 use client::ExtensionMetadata;
 use collections::{BTreeMap, BTreeSet};
 use editor::{Editor, EditorElement, EditorStyle};
-use extension::{ExtensionManifest, ExtensionOperation, ExtensionStore};
+use extension_host::{ExtensionManifest, ExtensionOperation, ExtensionStore};
 use fuzzy::{match_strings, StringMatchCandidate};
 use gpui::{
-    actions, uniform_list, AppContext, EventEmitter, Flatten, FocusableView, InteractiveElement,
-    KeyContext, ParentElement, Render, Styled, Task, TextStyle, UniformListScrollHandle, View,
-    ViewContext, VisualContext, WeakView, WindowContext,
+    actions, uniform_list, Action, AppContext, EventEmitter, Flatten, FocusableView,
+    InteractiveElement, KeyContext, ParentElement, Render, Styled, Task, TextStyle,
+    UniformListScrollHandle, View, ViewContext, VisualContext, WeakView, WindowContext,
 };
 use num_format::{Locale, ToFormattedString};
 use project::DirectoryLister;
@@ -24,7 +24,7 @@ use release_channel::ReleaseChannel;
 use settings::Settings;
 use theme::ThemeSettings;
 use ui::{prelude::*, CheckboxWithLabel, ContextMenu, PopoverMenu, ToggleButton, Tooltip};
-use vim::VimModeSetting;
+use vim_mode_setting::VimModeSetting;
 use workspace::{
     item::{Item, ItemEvent},
     Workspace, WorkspaceId,
@@ -35,12 +35,12 @@ use crate::extension_version_selector::{
     ExtensionVersionSelector, ExtensionVersionSelectorDelegate,
 };
 
-actions!(zed, [Extensions, InstallDevExtension]);
+actions!(zed, [InstallDevExtension]);
 
 pub fn init(cx: &mut AppContext) {
     cx.observe_new_views(move |workspace: &mut Workspace, cx| {
         workspace
-            .register_action(move |workspace, _: &Extensions, cx| {
+            .register_action(move |workspace, _: &zed_actions::Extensions, cx| {
                 let existing = workspace
                     .active_pane()
                     .read(cx)
@@ -95,11 +95,10 @@ pub fn init(cx: &mut AppContext) {
                     .detach();
             });
 
-        cx.subscribe(workspace.project(), |_, _, event, cx| match event {
-            project::Event::LanguageNotFound(buffer) => {
+        cx.subscribe(workspace.project(), |_, _, event, cx| {
+            if let project::Event::LanguageNotFound(buffer) = event {
                 extension_suggest::suggest(buffer.clone(), cx);
             }
-            _ => {}
         })
         .detach();
     })
@@ -204,8 +203,8 @@ impl ExtensionsPage {
             let subscriptions = [
                 cx.observe(&store, |_, _, cx| cx.notify()),
                 cx.subscribe(&store, move |this, _, event, cx| match event {
-                    extension::Event::ExtensionsUpdated => this.fetch_extensions_debounced(cx),
-                    extension::Event::ExtensionInstalled(extension_id) => {
+                    extension_host::Event::ExtensionsUpdated => this.fetch_extensions_debounced(cx),
+                    extension_host::Event::ExtensionInstalled(extension_id) => {
                         this.on_extension_installed(workspace_handle.clone(), extension_id, cx)
                     }
                     _ => {}
@@ -252,14 +251,13 @@ impl ExtensionsPage {
             .collect::<Vec<_>>();
         if !themes.is_empty() {
             workspace
-                .update(cx, |workspace, cx| {
-                    theme_selector::toggle(
-                        workspace,
-                        &theme_selector::Toggle {
+                .update(cx, |_workspace, cx| {
+                    cx.dispatch_action(
+                        zed_actions::theme_selector::Toggle {
                             themes_filter: Some(themes),
-                        },
-                        cx,
-                    )
+                        }
+                        .boxed_clone(),
+                    );
                 })
                 .ok();
         }
@@ -452,28 +450,34 @@ impl ExtensionsPage {
             )
             .child(
                 h_flex()
+                    .gap_2()
                     .justify_between()
                     .child(
-                        Label::new(format!(
-                            "{}: {}",
-                            if extension.authors.len() > 1 {
-                                "Authors"
-                            } else {
-                                "Author"
-                            },
-                            extension.authors.join(", ")
-                        ))
-                        .size(LabelSize::Small),
+                        div().overflow_x_hidden().text_ellipsis().child(
+                            Label::new(format!(
+                                "{}: {}",
+                                if extension.authors.len() > 1 {
+                                    "Authors"
+                                } else {
+                                    "Author"
+                                },
+                                extension.authors.join(", ")
+                            ))
+                            .size(LabelSize::Small),
+                        ),
                     )
                     .child(Label::new("<>").size(LabelSize::Small)),
             )
             .child(
                 h_flex()
+                    .gap_2()
                     .justify_between()
                     .children(extension.description.as_ref().map(|description| {
-                        Label::new(description.clone())
-                            .size(LabelSize::Small)
-                            .color(Color::Default)
+                        div().overflow_x_hidden().text_ellipsis().child(
+                            Label::new(description.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Default),
+                        )
                     }))
                     .children(repository_url.map(|repository_url| {
                         IconButton::new(
@@ -547,18 +551,21 @@ impl ExtensionsPage {
             )
             .child(
                 h_flex()
+                    .gap_2()
                     .justify_between()
                     .child(
-                        Label::new(format!(
-                            "{}: {}",
-                            if extension.manifest.authors.len() > 1 {
-                                "Authors"
-                            } else {
-                                "Author"
-                            },
-                            extension.manifest.authors.join(", ")
-                        ))
-                        .size(LabelSize::Small),
+                        div().overflow_x_hidden().text_ellipsis().child(
+                            Label::new(format!(
+                                "{}: {}",
+                                if extension.manifest.authors.len() > 1 {
+                                    "Authors"
+                                } else {
+                                    "Author"
+                                },
+                                extension.manifest.authors.join(", ")
+                            ))
+                            .size(LabelSize::Small),
+                        ),
                     )
                     .child(
                         Label::new(format!(
@@ -573,7 +580,7 @@ impl ExtensionsPage {
                     .gap_2()
                     .justify_between()
                     .children(extension.manifest.description.as_ref().map(|description| {
-                        h_flex().overflow_x_hidden().child(
+                        div().overflow_x_hidden().text_ellipsis().child(
                             Label::new(description.clone())
                                 .size(LabelSize::Small)
                                 .color(Color::Default),
@@ -633,7 +640,7 @@ impl ExtensionsPage {
             context_menu.entry(
                 "Install Another Version...",
                 None,
-                cx.handler_for(&this, move |this, cx| {
+                cx.handler_for(this, move |this, cx| {
                     this.show_extension_version_list(extension_id.clone(), cx)
                 }),
             )
@@ -684,7 +691,7 @@ impl ExtensionsPage {
         cx: &mut ViewContext<Self>,
     ) -> (Button, Option<Button>) {
         let is_compatible =
-            extension::is_version_compatible(ReleaseChannel::global(cx), &extension);
+            extension_host::is_version_compatible(ReleaseChannel::global(cx), extension);
 
         if has_dev_extension {
             // If we have a dev extension for the given extension, just treat it as uninstalled.
@@ -824,7 +831,7 @@ impl ExtensionsPage {
         };
 
         EditorElement::new(
-            &editor,
+            editor,
             EditorStyle {
                 background: cx.theme().colors().editor_background,
                 local_player: cx.theme().players().local(),
@@ -860,7 +867,7 @@ impl ExtensionsPage {
             // If the search was just cleared then we can just reload the list
             // of extensions without a debounce, which allows us to avoid seeing
             // an intermittent flash of a "no extensions" state.
-            if let Some(_) = search {
+            if search.is_some() {
                 cx.background_executor()
                     .timer(Duration::from_millis(250))
                     .await;
@@ -956,7 +963,7 @@ impl ExtensionsPage {
             {
                 self.upsells.insert(*feature);
             } else {
-                self.upsells.remove(&feature);
+                self.upsells.remove(feature);
             }
         }
     }

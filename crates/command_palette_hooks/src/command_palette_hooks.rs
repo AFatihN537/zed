@@ -39,11 +39,13 @@ impl CommandPaletteFilter {
     }
 
     /// Updates the global [`CommandPaletteFilter`] using the given closure.
-    pub fn update_global<F, R>(cx: &mut AppContext, update: F) -> R
+    pub fn update_global<F>(cx: &mut AppContext, update: F)
     where
-        F: FnOnce(&mut Self, &mut AppContext) -> R,
+        F: FnOnce(&mut Self, &mut AppContext),
     {
-        cx.update_global(|this: &mut GlobalCommandPaletteFilter, cx| update(&mut this.0, cx))
+        if cx.has_global::<GlobalCommandPaletteFilter>() {
+            cx.update_global(|this: &mut GlobalCommandPaletteFilter, cx| update(&mut this.0, cx))
+        }
     }
 
     /// Returns whether the given [`Action`] is hidden by the filter.
@@ -118,9 +120,7 @@ impl CommandPaletteInterceptor {
 
     /// Intercepts the given query from the command palette.
     pub fn intercept(&self, query: &str, cx: &AppContext) -> Option<CommandInterceptResult> {
-        let Some(handler) = self.0.as_ref() else {
-            return None;
-        };
+        let handler = self.0.as_ref()?;
 
         (handler)(query, cx)
     }

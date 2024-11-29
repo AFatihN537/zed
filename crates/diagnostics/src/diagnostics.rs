@@ -9,14 +9,10 @@ use anyhow::Result;
 use collections::{BTreeSet, HashSet};
 use editor::{
     diagnostic_block_renderer,
-    display_map::{BlockDisposition, BlockProperties, BlockStyle, CustomBlockId, RenderBlock},
+    display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId, RenderBlock},
     highlight_diagnostic_message,
     scroll::Autoscroll,
     Editor, EditorEvent, ExcerptId, ExcerptRange, MultiBuffer, ToOffset,
-};
-use futures::{
-    channel::mpsc::{self, UnboundedSender},
-    StreamExt as _,
 };
 use gpui::{
     actions, div, svg, AnyElement, AnyView, AppContext, Context, EventEmitter, FocusHandle,
@@ -36,6 +32,8 @@ use std::{
     cmp::Ordering,
     mem,
     ops::Range,
+    sync::Arc,
+    time::Duration,
 };
 use theme::ActiveTheme;
 pub use toolbar_controls::ToolbarControls;
@@ -62,11 +60,10 @@ struct ProjectDiagnosticsEditor {
     summary: DiagnosticSummary,
     excerpts: Model<MultiBuffer>,
     path_states: Vec<PathState>,
-    paths_to_update: BTreeSet<(ProjectPath, LanguageServerId)>,
+    paths_to_update: BTreeSet<(ProjectPath, Option<LanguageServerId>)>,
     include_warnings: bool,
     context: u32,
-    update_paths_tx: UnboundedSender<(ProjectPath, Option<LanguageServerId>)>,
-    _update_excerpts_task: Task<Result<()>>,
+    update_excerpts_task: Option<Task<Result<()>>>,
     _subscription: Subscription,
 }
 
@@ -86,6 +83,8 @@ struct DiagnosticGroupState {
 
 impl EventEmitter<EditorEvent> for ProjectDiagnosticsEditor {}
 
+const DIAGNOSTICS_UPDATE_DEBOUNCE: Duration = Duration::from_millis(50);
+
 impl Render for ProjectDiagnosticsEditor {
     fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
         let child = if self.path_states.is_empty() {
@@ -101,7 +100,7 @@ impl Render for ProjectDiagnosticsEditor {
         };
 
         div()
-            .track_focus(&self.focus_handle)
+            .track_focus(&self.focus_handle(cx))
             .when(self.path_states.is_empty(), |el| {
                 el.key_context("EmptyPane")
             })
@@ -129,22 +128,33 @@ impl ProjectDiagnosticsEditor {
                 }
                 project::Event::DiskBasedDiagnosticsFinished { language_server_id } => {
                     log::debug!("disk based diagnostics finished for server {language_server_id}");
-                    this.enqueue_update_stale_excerpts(Some(*language_server_id));
+                    this.update_stale_excerpts(cx);
                 }
                 project::Event::DiagnosticsUpdated {
                     language_server_id,
                     path,
                 } => {
-                    this.paths_to_update
-                        .insert((path.clone(), *language_server_id));
-                    this.summary = project.read(cx).diagnostic_summary(false, cx);
-                    cx.emit(EditorEvent::TitleChanged);
+                    let max_severity = this.max_severity();
+                    let has_diagnostics_to_display = project.read(cx).lsp_store().read(cx).diagnostics_for_buffer(path)
+                        .into_iter().flatten()
+                        .filter(|(server_id, _)| language_server_id == server_id)
+                        .flat_map(|(_, diagnostics)| diagnostics)
+                        .any(|diagnostic| diagnostic.diagnostic.severity <= max_severity);
 
-                    if this.editor.focus_handle(cx).contains_focused(cx) || this.focus_handle.contains_focused(cx) {
-                        log::debug!("diagnostics updated for server {language_server_id}, path {path:?}. recording change");
+                    if has_diagnostics_to_display {
+                        this.paths_to_update
+                            .insert((path.clone(), Some(*language_server_id)));
+                        this.summary = project.read(cx).diagnostic_summary(false, cx);
+                        cx.emit(EditorEvent::TitleChanged);
+
+                        if this.editor.focus_handle(cx).contains_focused(cx) || this.focus_handle.contains_focused(cx) {
+                            log::debug!("diagnostics updated for server {language_server_id}, path {path:?}. recording change");
+                        } else {
+                            log::debug!("diagnostics updated for server {language_server_id}, path {path:?}. updating excerpts");
+                            this.update_stale_excerpts(cx);
+                        }
                     } else {
-                        log::debug!("diagnostics updated for server {language_server_id}, path {path:?}. updating excerpts");
-                        this.enqueue_update_stale_excerpts(Some(*language_server_id));
+                        log::debug!("diagnostics updated for server {language_server_id}, path {path:?}. no diagnostics to display");
                     }
                 }
                 _ => {}
@@ -156,12 +166,7 @@ impl ProjectDiagnosticsEditor {
         cx.on_focus_out(&focus_handle, |this, _event, cx| this.focus_out(cx))
             .detach();
 
-        let excerpts = cx.new_model(|cx| {
-            MultiBuffer::new(
-                project_handle.read(cx).replica_id(),
-                project_handle.read(cx).capability(),
-            )
-        });
+        let excerpts = cx.new_model(|cx| MultiBuffer::new(project_handle.read(cx).capability()));
         let editor = cx.new_view(|cx| {
             let mut editor =
                 Editor::for_multibuffer(excerpts.clone(), Some(project_handle.clone()), false, cx);
@@ -176,13 +181,11 @@ impl ProjectDiagnosticsEditor {
                         cx.focus(&this.focus_handle);
                     }
                 }
-                EditorEvent::Blurred => this.enqueue_update_stale_excerpts(None),
+                EditorEvent::Blurred => this.update_stale_excerpts(cx),
                 _ => {}
             }
         })
         .detach();
-
-        let (update_excerpts_tx, mut update_excerpts_rx) = mpsc::unbounded();
 
         let project = project_handle.read(cx);
         let mut this = Self {
@@ -196,25 +199,46 @@ impl ProjectDiagnosticsEditor {
             path_states: Default::default(),
             paths_to_update: Default::default(),
             include_warnings: ProjectDiagnosticsSettings::get_global(cx).include_warnings,
-            update_paths_tx: update_excerpts_tx,
-            _update_excerpts_task: cx.spawn(move |this, mut cx| async move {
-                while let Some((path, language_server_id)) = update_excerpts_rx.next().await {
-                    if let Some(buffer) = project_handle
-                        .update(&mut cx, |project, cx| project.open_buffer(path.clone(), cx))?
-                        .await
-                        .log_err()
-                    {
-                        this.update(&mut cx, |this, cx| {
-                            this.update_excerpts(path, language_server_id, buffer, cx);
-                        })?;
-                    }
-                }
-                anyhow::Ok(())
-            }),
+            update_excerpts_task: None,
             _subscription: project_event_subscription,
         };
-        this.enqueue_update_all_excerpts(cx);
+        this.update_all_excerpts(cx);
         this
+    }
+
+    fn update_stale_excerpts(&mut self, cx: &mut ViewContext<Self>) {
+        if self.update_excerpts_task.is_some() {
+            return;
+        }
+        let project_handle = self.project.clone();
+        self.update_excerpts_task = Some(cx.spawn(|this, mut cx| async move {
+            cx.background_executor()
+                .timer(DIAGNOSTICS_UPDATE_DEBOUNCE)
+                .await;
+            loop {
+                let Some((path, language_server_id)) = this.update(&mut cx, |this, _| {
+                    let Some((path, language_server_id)) = this.paths_to_update.pop_first() else {
+                        this.update_excerpts_task.take();
+                        return None;
+                    };
+                    Some((path, language_server_id))
+                })?
+                else {
+                    break;
+                };
+
+                if let Some(buffer) = project_handle
+                    .update(&mut cx, |project, cx| project.open_buffer(path.clone(), cx))?
+                    .await
+                    .log_err()
+                {
+                    this.update(&mut cx, |this, cx| {
+                        this.update_excerpts(path, language_server_id, buffer, cx);
+                    })?;
+                }
+            }
+            Ok(())
+        }));
     }
 
     fn new(
@@ -244,7 +268,7 @@ impl ProjectDiagnosticsEditor {
 
     fn toggle_warnings(&mut self, _: &ToggleWarnings, cx: &mut ViewContext<Self>) {
         self.include_warnings = !self.include_warnings;
-        self.enqueue_update_all_excerpts(cx);
+        self.update_all_excerpts(cx);
         cx.notify();
     }
 
@@ -256,37 +280,28 @@ impl ProjectDiagnosticsEditor {
 
     fn focus_out(&mut self, cx: &mut ViewContext<Self>) {
         if !self.focus_handle.is_focused(cx) && !self.editor.focus_handle(cx).is_focused(cx) {
-            self.enqueue_update_stale_excerpts(None);
+            self.update_stale_excerpts(cx);
         }
     }
 
     /// Enqueue an update of all excerpts. Updates all paths that either
     /// currently have diagnostics or are currently present in this view.
-    fn enqueue_update_all_excerpts(&mut self, cx: &mut ViewContext<Self>) {
+    fn update_all_excerpts(&mut self, cx: &mut ViewContext<Self>) {
         self.project.update(cx, |project, cx| {
             let mut paths = project
                 .diagnostic_summaries(false, cx)
-                .map(|(path, _, _)| path)
+                .map(|(path, _, _)| (path, None))
                 .collect::<BTreeSet<_>>();
-            paths.extend(self.path_states.iter().map(|state| state.path.clone()));
-            for path in paths {
-                self.update_paths_tx.unbounded_send((path, None)).unwrap();
-            }
+            paths.extend(
+                self.path_states
+                    .iter()
+                    .map(|state| (state.path.clone(), None)),
+            );
+            let paths_to_update = std::mem::take(&mut self.paths_to_update);
+            paths.extend(paths_to_update.into_iter().map(|(path, _)| (path, None)));
+            self.paths_to_update = paths;
         });
-    }
-
-    /// Enqueue an update of the excerpts for any path whose diagnostics are known
-    /// to have changed. If a language server id is passed, then only the excerpts for
-    /// that language server's diagnostics will be updated. Otherwise, all stale excerpts
-    /// will be refreshed.
-    fn enqueue_update_stale_excerpts(&mut self, language_server_id: Option<LanguageServerId>) {
-        for (path, server_id) in &self.paths_to_update {
-            if language_server_id.map_or(true, |id| id == *server_id) {
-                self.update_paths_tx
-                    .unbounded_send((path.clone(), Some(*server_id)))
-                    .unwrap();
-            }
-        }
+        self.update_stale_excerpts(cx);
     }
 
     fn update_excerpts(
@@ -296,11 +311,6 @@ impl ProjectDiagnosticsEditor {
         buffer: Model<Buffer>,
         cx: &mut ViewContext<Self>,
     ) {
-        self.paths_to_update.retain(|(path, server_id)| {
-            *path != path_to_update
-                || server_to_update.map_or(false, |to_update| *server_id != to_update)
-        });
-
         let was_empty = self.path_states.is_empty();
         let snapshot = buffer.read(cx).snapshot();
         let path_ix = match self
@@ -330,16 +340,12 @@ impl ProjectDiagnosticsEditor {
             ExcerptId::min()
         };
 
+        let max_severity = self.max_severity();
         let path_state = &mut self.path_states[path_ix];
         let mut new_group_ixs = Vec::new();
         let mut blocks_to_add = Vec::new();
         let mut blocks_to_remove = HashSet::default();
         let mut first_excerpt_id = None;
-        let max_severity = if self.include_warnings {
-            DiagnosticSeverity::WARNING
-        } else {
-            DiagnosticSeverity::ERROR
-        };
         let excerpts_snapshot = self.excerpts.update(cx, |excerpts, cx| {
             let mut old_groups = mem::take(&mut path_state.diagnostic_groups)
                 .into_iter()
@@ -432,7 +438,7 @@ impl ProjectDiagnosticsEditor {
                                 .unwrap();
 
                             prev_excerpt_id = excerpt_id;
-                            first_excerpt_id.get_or_insert_with(|| prev_excerpt_id);
+                            first_excerpt_id.get_or_insert(prev_excerpt_id);
                             group_state.excerpts.push(excerpt_id);
                             let header_position = (excerpt_id, language::Anchor::MIN);
 
@@ -444,11 +450,11 @@ impl ProjectDiagnosticsEditor {
                                     primary.message.split('\n').next().unwrap().to_string();
                                 group_state.block_count += 1;
                                 blocks_to_add.push(BlockProperties {
-                                    position: header_position,
+                                    placement: BlockPlacement::Above(header_position),
                                     height: 2,
                                     style: BlockStyle::Sticky,
                                     render: diagnostic_header_renderer(primary),
-                                    disposition: BlockDisposition::Above,
+                                    priority: 0,
                                 });
                             }
 
@@ -463,13 +469,16 @@ impl ProjectDiagnosticsEditor {
                                 if !diagnostic.message.is_empty() {
                                     group_state.block_count += 1;
                                     blocks_to_add.push(BlockProperties {
-                                        position: (excerpt_id, entry.range.start),
+                                        placement: BlockPlacement::Below((
+                                            excerpt_id,
+                                            entry.range.start,
+                                        )),
                                         height: diagnostic.message.matches('\n').count() as u32 + 1,
                                         style: BlockStyle::Fixed,
                                         render: diagnostic_block_renderer(
                                             diagnostic, None, true, true,
                                         ),
-                                        disposition: BlockDisposition::Below,
+                                        priority: 0,
                                     });
                                 }
                             }
@@ -489,7 +498,7 @@ impl ProjectDiagnosticsEditor {
                     blocks_to_remove.extend(group_state.blocks.iter().copied());
                 } else if let Some((_, group_state)) = to_keep {
                     prev_excerpt_id = *group_state.excerpts.last().unwrap();
-                    first_excerpt_id.get_or_insert_with(|| prev_excerpt_id);
+                    first_excerpt_id.get_or_insert(prev_excerpt_id);
                     path_state.diagnostic_groups.push(group_state);
                 }
             }
@@ -501,13 +510,25 @@ impl ProjectDiagnosticsEditor {
             editor.remove_blocks(blocks_to_remove, None, cx);
             let block_ids = editor.insert_blocks(
                 blocks_to_add.into_iter().flat_map(|block| {
-                    let (excerpt_id, text_anchor) = block.position;
+                    let placement = match block.placement {
+                        BlockPlacement::Above((excerpt_id, text_anchor)) => BlockPlacement::Above(
+                            excerpts_snapshot.anchor_in_excerpt(excerpt_id, text_anchor)?,
+                        ),
+                        BlockPlacement::Below((excerpt_id, text_anchor)) => BlockPlacement::Below(
+                            excerpts_snapshot.anchor_in_excerpt(excerpt_id, text_anchor)?,
+                        ),
+                        BlockPlacement::Replace(_) => {
+                            unreachable!(
+                                "no Replace block should have been pushed to blocks_to_add"
+                            )
+                        }
+                    };
                     Some(BlockProperties {
-                        position: excerpts_snapshot.anchor_in_excerpt(excerpt_id, text_anchor)?,
+                        placement,
                         height: block.height,
                         style: block.style,
                         render: block.render,
-                        disposition: block.disposition,
+                        priority: 0,
                     })
                 }),
                 Some(Autoscroll::fit()),
@@ -613,6 +634,14 @@ impl ProjectDiagnosticsEditor {
             prev_path = Some(path);
         }
     }
+
+    fn max_severity(&self) -> DiagnosticSeverity {
+        if self.include_warnings {
+            DiagnosticSeverity::WARNING
+        } else {
+            DiagnosticSeverity::ERROR
+        }
+    }
 }
 
 impl FocusableView for ProjectDiagnosticsEditor {
@@ -642,37 +671,42 @@ impl Item for ProjectDiagnosticsEditor {
     }
 
     fn tab_content(&self, params: TabContentParams, _: &WindowContext) -> AnyElement {
-        if self.summary.error_count == 0 && self.summary.warning_count == 0 {
-            Label::new("No problems")
-                .color(params.text_color())
-                .into_any_element()
-        } else {
-            h_flex()
-                .gap_1()
-                .when(self.summary.error_count > 0, |then| {
+        h_flex()
+            .gap_1()
+            .when(
+                self.summary.error_count == 0 && self.summary.warning_count == 0,
+                |then| {
                     then.child(
                         h_flex()
                             .gap_1()
-                            .child(Icon::new(IconName::XCircle).color(Color::Error))
-                            .child(
-                                Label::new(self.summary.error_count.to_string())
-                                    .color(params.text_color()),
-                            ),
+                            .child(Icon::new(IconName::Check).color(Color::Success))
+                            .child(Label::new("No problems").color(params.text_color())),
                     )
-                })
-                .when(self.summary.warning_count > 0, |then| {
-                    then.child(
-                        h_flex()
-                            .gap_1()
-                            .child(Icon::new(IconName::ExclamationTriangle).color(Color::Warning))
-                            .child(
-                                Label::new(self.summary.warning_count.to_string())
-                                    .color(params.text_color()),
-                            ),
-                    )
-                })
-                .into_any_element()
-        }
+                },
+            )
+            .when(self.summary.error_count > 0, |then| {
+                then.child(
+                    h_flex()
+                        .gap_1()
+                        .child(Icon::new(IconName::XCircle).color(Color::Error))
+                        .child(
+                            Label::new(self.summary.error_count.to_string())
+                                .color(params.text_color()),
+                        ),
+                )
+            })
+            .when(self.summary.warning_count > 0, |then| {
+                then.child(
+                    h_flex()
+                        .gap_1()
+                        .child(Icon::new(IconName::Warning).color(Color::Warning))
+                        .child(
+                            Label::new(self.summary.warning_count.to_string())
+                                .color(params.text_color()),
+                        ),
+                )
+            })
+            .into_any_element()
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {
@@ -712,6 +746,10 @@ impl Item for ProjectDiagnosticsEditor {
 
     fn is_dirty(&self, cx: &AppContext) -> bool {
         self.excerpts.read(cx).is_dirty(cx)
+    }
+
+    fn has_deleted_file(&self, cx: &AppContext) -> bool {
+        self.excerpts.read(cx).has_deleted_file(cx)
     }
 
     fn has_conflict(&self, cx: &AppContext) -> bool {
@@ -759,7 +797,7 @@ impl Item for ProjectDiagnosticsEditor {
         }
     }
 
-    fn breadcrumb_location(&self) -> ToolbarItemLocation {
+    fn breadcrumb_location(&self, _: &AppContext) -> ToolbarItemLocation {
         ToolbarItemLocation::PrimaryLeft
     }
 
@@ -773,15 +811,16 @@ impl Item for ProjectDiagnosticsEditor {
     }
 }
 
-const DIAGNOSTIC_HEADER: &'static str = "diagnostic header";
+const DIAGNOSTIC_HEADER: &str = "diagnostic header";
 
 fn diagnostic_header_renderer(diagnostic: Diagnostic) -> RenderBlock {
     let (message, code_ranges) = highlight_diagnostic_message(&diagnostic, None);
     let message: SharedString = message;
-    Box::new(move |cx| {
+    Arc::new(move |cx| {
         let highlight_style: HighlightStyle = cx.theme().colors().text_accent.into();
         h_flex()
             .id(DIAGNOSTIC_HEADER)
+            .block_mouse_down()
             .h(2. * cx.line_height())
             .pl_10()
             .pr_5()
@@ -801,7 +840,7 @@ fn diagnostic_header_renderer(diagnostic: Diagnostic) -> RenderBlock {
                                         icon.path(IconName::XCircle.path())
                                             .text_color(Color::Error.color(cx))
                                     } else {
-                                        icon.path(IconName::ExclamationTriangle.path())
+                                        icon.path(IconName::Warning.path())
                                             .text_color(Color::Warning.color(cx))
                                     }
                                 }),

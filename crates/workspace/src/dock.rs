@@ -15,7 +15,7 @@ use std::sync::Arc;
 use ui::{h_flex, ContextMenu, IconButton, Tooltip};
 use ui::{prelude::*, right_click_menu};
 
-const RESIZE_HANDLE_SIZE: Pixels = Pixels(6.);
+pub(crate) const RESIZE_HANDLE_SIZE: Pixels = Pixels(6.);
 
 pub enum PanelEvent {
     ZoomIn,
@@ -187,7 +187,7 @@ pub enum DockPosition {
 }
 
 impl DockPosition {
-    fn to_label(&self) -> &'static str {
+    fn label(&self) -> &'static str {
         match self {
             Self::Left => "left",
             Self::Bottom => "bottom",
@@ -485,7 +485,7 @@ impl Dock {
             self.set_open(serialized.visible, cx);
             return true;
         }
-        return false;
+        false
     }
 
     pub fn remove_panel<T: Panel>(&mut self, panel: &View<T>, cx: &mut ViewContext<Self>) {
@@ -494,11 +494,15 @@ impl Dock {
             .iter()
             .position(|entry| entry.panel.panel_id() == Entity::entity_id(panel))
         {
-            if panel_ix == self.active_panel_index {
-                self.active_panel_index = 0;
-                self.set_open(false, cx);
-            } else if panel_ix < self.active_panel_index {
-                self.active_panel_index -= 1;
+            match panel_ix.cmp(&self.active_panel_index) {
+                std::cmp::Ordering::Less => {
+                    self.active_panel_index -= 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    self.active_panel_index = 0;
+                    self.set_open(false, cx);
+                }
+                std::cmp::Ordering::Greater => {}
             }
             self.panel_entries.remove(panel_ix);
             cx.notify();
@@ -570,6 +574,7 @@ impl Dock {
     pub fn resize_active_panel(&mut self, size: Option<Pixels>, cx: &mut ViewContext<Self>) {
         if let Some(entry) = self.panel_entries.get_mut(self.active_panel_index) {
             let size = size.map(|size| size.max(RESIZE_HANDLE_SIZE).round());
+
             entry.panel.set_size(size, cx);
             cx.notify();
         }
@@ -589,6 +594,15 @@ impl Dock {
 
         dispatch_context
     }
+
+    pub fn clamp_panel_size(&mut self, max_size: Pixels, cx: &mut WindowContext) {
+        let max_size = px((max_size.0 - RESIZE_HANDLE_SIZE.0).abs());
+        for panel in self.panel_entries.iter().map(|entry| &entry.panel) {
+            if panel.size(cx) > max_size {
+                panel.set_size(Some(max_size.max(RESIZE_HANDLE_SIZE)), cx);
+            }
+        }
+    }
 }
 
 impl Render for Dock {
@@ -601,7 +615,7 @@ impl Render for Dock {
             let create_resize_handle = || {
                 let handle = div()
                     .id("resize-handle")
-                    .on_drag(DraggedDock(position), |dock, cx| {
+                    .on_drag(DraggedDock(position), |dock, _, cx| {
                         cx.stop_propagation();
                         cx.new_view(|_| dock.clone())
                     })
@@ -654,7 +668,7 @@ impl Render for Dock {
 
             div()
                 .key_context(dispatch_context)
-                .track_focus(&self.focus_handle)
+                .track_focus(&self.focus_handle(cx))
                 .flex()
                 .bg(cx.theme().colors().panel_background)
                 .border_color(cx.theme().colors().border)
@@ -685,7 +699,7 @@ impl Render for Dock {
         } else {
             div()
                 .key_context(dispatch_context)
-                .track_focus(&self.focus_handle)
+                .track_focus(&self.focus_handle(cx))
         }
     }
 }
@@ -726,7 +740,7 @@ impl Render for PanelButtons {
                     let action = dock.toggle_action();
 
                     let tooltip: SharedString =
-                        format!("Close {} dock", dock.position.to_label()).into();
+                        format!("Close {} dock", dock.position.label()).into();
 
                     (action, tooltip)
                 } else {
@@ -751,7 +765,7 @@ impl Render for PanelButtons {
                                     {
                                         let panel = panel.clone();
                                         menu = menu.entry(
-                                            format!("Dock {}", position.to_label()),
+                                            format!("Dock {}", position.label()),
                                             None,
                                             move |cx| {
                                                 panel.set_position(position, cx);
@@ -822,8 +836,8 @@ pub mod test {
     }
 
     impl Render for TestPanel {
-        fn render(&mut self, _cx: &mut ViewContext<Self>) -> impl IntoElement {
-            div().id("test").track_focus(&self.focus_handle)
+        fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+            div().id("test").track_focus(&self.focus_handle(cx))
         }
     }
 

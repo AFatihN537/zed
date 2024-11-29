@@ -9,6 +9,8 @@ use std::{
     sync::Arc,
 };
 
+use super::LineWrapper;
+
 /// A laid out and styled line of text
 #[derive(Default, Debug)]
 pub struct LineLayout {
@@ -27,7 +29,7 @@ pub struct LineLayout {
 }
 
 /// A run of text that has been shaped .
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ShapedRun {
     /// The font id for this run
     pub font_id: FontId,
@@ -152,9 +154,18 @@ impl LineLayout {
                 continue;
             }
 
-            if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
-                last_candidate_ix = Some(boundary);
-                last_candidate_x = x;
+            // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
+            // but there are some differences, so we have to duplicate the code here.
+            if LineWrapper::is_word_char(ch) {
+                if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
+                    last_candidate_ix = Some(boundary);
+                    last_candidate_x = x;
+                }
+            } else {
+                if ch != ' ' && first_non_whitespace_ix.is_some() {
+                    last_candidate_ix = Some(boundary);
+                    last_candidate_x = x;
+                }
             }
 
             if ch != ' ' && first_non_whitespace_ix.is_none() {
@@ -374,20 +385,28 @@ impl LineLayoutCache {
         let mut previous_frame = &mut *self.previous_frame.lock();
         let mut current_frame = &mut *self.current_frame.write();
 
-        for key in &previous_frame.used_lines[range.start.lines_index..range.end.lines_index] {
-            if let Some((key, line)) = previous_frame.lines.remove_entry(key) {
-                current_frame.lines.insert(key, line);
+        if let Some(cached_keys) = previous_frame
+            .used_lines
+            .get(range.start.lines_index..range.end.lines_index)
+        {
+            for key in cached_keys {
+                if let Some((key, line)) = previous_frame.lines.remove_entry(key) {
+                    current_frame.lines.insert(key, line);
+                }
+                current_frame.used_lines.push(key.clone());
             }
-            current_frame.used_lines.push(key.clone());
         }
 
-        for key in &previous_frame.used_wrapped_lines
-            [range.start.wrapped_lines_index..range.end.wrapped_lines_index]
+        if let Some(cached_keys) = previous_frame
+            .used_wrapped_lines
+            .get(range.start.wrapped_lines_index..range.end.wrapped_lines_index)
         {
-            if let Some((key, line)) = previous_frame.wrapped_lines.remove_entry(key) {
-                current_frame.wrapped_lines.insert(key, line);
+            for key in cached_keys {
+                if let Some((key, line)) = previous_frame.wrapped_lines.remove_entry(key) {
+                    current_frame.wrapped_lines.insert(key, line);
+                }
+                current_frame.used_wrapped_lines.push(key.clone());
             }
-            current_frame.used_wrapped_lines.push(key.clone());
         }
     }
 

@@ -1,4 +1,5 @@
 pub mod arc_cow;
+pub mod command;
 pub mod fs;
 pub mod paths;
 pub mod serde;
@@ -6,7 +7,7 @@ pub mod serde;
 pub mod test;
 
 use futures::Future;
-use rand::{seq::SliceRandom, Rng};
+
 use regex::Regex;
 use std::sync::OnceLock;
 use std::{
@@ -33,142 +34,6 @@ macro_rules! debug_panic {
             log::error!("{}\n{:?}", format_args!($($fmt_arg)*), backtrace);
         }
     };
-}
-
-#[macro_export]
-macro_rules! with_clone {
-    ($i:ident, move ||$l:expr) => {{
-        let $i = $i.clone();
-        move || {
-            $l
-        }
-    }};
-    ($i:ident, move |$($k:pat_param),*|$l:expr) => {{
-        let $i = $i.clone();
-        move |$( $k ),*| {
-            $l
-        }
-    }};
-
-    (($($i:ident),+), move ||$l:expr) => {{
-        let ($($i),+) = ($($i.clone()),+);
-        move || {
-            $l
-        }
-    }};
-    (($($i:ident),+), move |$($k:pat_param),*|$l:expr) => {{
-        let ($($i),+) = ($($i.clone()),+);
-        move |$( $k ),*| {
-            $l
-        }
-    }};
-}
-
-mod test_with_clone {
-
-    // If this test compiles, it works
-    #[test]
-    fn test() {
-        let x = "String".to_string();
-        let y = std::sync::Arc::new(5);
-
-        fn no_arg(f: impl FnOnce()) {
-            f()
-        }
-
-        no_arg(with_clone!(x, move || {
-            drop(x);
-        }));
-
-        no_arg(with_clone!((x, y), move || {
-            drop(x);
-            drop(y);
-        }));
-
-        fn one_arg(f: impl FnOnce(usize)) {
-            f(1)
-        }
-
-        one_arg(with_clone!(x, move |_| {
-            drop(x);
-        }));
-        one_arg(with_clone!((x, y), move |b| {
-            drop(x);
-            drop(y);
-            println!("{}", b);
-        }));
-
-        fn two_arg(f: impl FnOnce(usize, bool)) {
-            f(5, true)
-        }
-
-        two_arg(with_clone!((x, y), move |a, b| {
-            drop(x);
-            drop(y);
-            println!("{}{}", a, b)
-        }));
-        two_arg(with_clone!((x, y), move |a, _| {
-            drop(x);
-            drop(y);
-            println!("{}", a)
-        }));
-        two_arg(with_clone!((x, y), move |_, b| {
-            drop(x);
-            drop(y);
-            println!("{}", b)
-        }));
-
-        struct Example {
-            z: usize,
-        }
-
-        fn destructuring_example(f: impl FnOnce(Example)) {
-            f(Example { z: 10 })
-        }
-
-        destructuring_example(with_clone!(x, move |Example { z }| {
-            drop(x);
-            println!("{}", z);
-        }));
-
-        let a_long_variable_1 = "".to_string();
-        let a_long_variable_2 = "".to_string();
-        let a_long_variable_3 = "".to_string();
-        let a_long_variable_4 = "".to_string();
-        two_arg(with_clone!(
-            (
-                x,
-                y,
-                a_long_variable_1,
-                a_long_variable_2,
-                a_long_variable_3,
-                a_long_variable_4
-            ),
-            move |a, b| {
-                drop(x);
-                drop(y);
-                drop(a_long_variable_1);
-                drop(a_long_variable_2);
-                drop(a_long_variable_3);
-                drop(a_long_variable_4);
-                println!("{}{}", a, b)
-            }
-        ));
-
-        fn single_expression_body(f: impl FnOnce(usize) -> usize) -> usize {
-            f(20)
-        }
-
-        let _result = single_expression_body(with_clone!(y, move |z| *y + z));
-
-        // Explicitly move all variables
-        drop(x);
-        drop(y);
-        drop(a_long_variable_1);
-        drop(a_long_variable_2);
-        drop(a_long_variable_3);
-        drop(a_long_variable_4);
-    }
 }
 
 pub fn truncate(s: &str, max_chars: usize) -> &str {
@@ -251,7 +116,7 @@ pub fn parse_env_output(env: &str, mut f: impl FnMut(String, String)) {
 
     for line in env.split_terminator('\n') {
         if let Some(separator_index) = line.find('=') {
-            if &line[..separator_index] != "" {
+            if !line[..separator_index].is_empty() {
                 if let Some((key, value)) = Option::zip(current_key.take(), current_value.take()) {
                     f(key, value)
                 }
@@ -281,6 +146,12 @@ pub fn merge_json_value_into(source: serde_json::Value, target: &mut serde_json:
                 } else {
                     target.insert(key.clone(), value);
                 }
+            }
+        }
+
+        (Value::Array(source), Value::Array(target)) => {
+            for value in source {
+                target.push(value);
             }
         }
 
@@ -378,9 +249,13 @@ fn log_error_with_caller<E>(caller: core::panic::Location<'_>, error: E, level: 
 where
     E: std::fmt::Debug,
 {
+    #[cfg(not(target_os = "windows"))]
+    let file = caller.file();
+    #[cfg(target_os = "windows")]
+    let file = caller.file().replace('\\', "/");
     // In this codebase, the first segment of the file path is
     // the 'crates' folder, followed by the crate name.
-    let target = caller.file().split('/').nth(1);
+    let target = file.split('/').nth(1);
 
     log::logger().log(
         &log::Record::builder()
@@ -517,54 +392,59 @@ pub fn defer<F: FnOnce()>(f: F) -> Deferred<F> {
     Deferred(Some(f))
 }
 
-pub struct RandomCharIter<T: Rng> {
-    rng: T,
-    simple_text: bool,
-}
+#[cfg(any(test, feature = "test-support"))]
+mod rng {
+    use rand::{seq::SliceRandom, Rng};
+    pub struct RandomCharIter<T: Rng> {
+        rng: T,
+        simple_text: bool,
+    }
 
-impl<T: Rng> RandomCharIter<T> {
-    pub fn new(rng: T) -> Self {
-        Self {
-            rng,
-            simple_text: std::env::var("SIMPLE_TEXT").map_or(false, |v| !v.is_empty()),
+    impl<T: Rng> RandomCharIter<T> {
+        pub fn new(rng: T) -> Self {
+            Self {
+                rng,
+                simple_text: std::env::var("SIMPLE_TEXT").map_or(false, |v| !v.is_empty()),
+            }
+        }
+
+        pub fn with_simple_text(mut self) -> Self {
+            self.simple_text = true;
+            self
         }
     }
 
-    pub fn with_simple_text(mut self) -> Self {
-        self.simple_text = true;
-        self
-    }
-}
+    impl<T: Rng> Iterator for RandomCharIter<T> {
+        type Item = char;
 
-impl<T: Rng> Iterator for RandomCharIter<T> {
-    type Item = char;
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.simple_text {
+                return if self.rng.gen_range(0..100) < 5 {
+                    Some('\n')
+                } else {
+                    Some(self.rng.gen_range(b'a'..b'z' + 1).into())
+                };
+            }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.simple_text {
-            return if self.rng.gen_range(0..100) < 5 {
-                Some('\n')
-            } else {
-                Some(self.rng.gen_range(b'a'..b'z' + 1).into())
-            };
-        }
-
-        match self.rng.gen_range(0..100) {
-            // whitespace
-            0..=19 => [' ', '\n', '\r', '\t'].choose(&mut self.rng).copied(),
-            // two-byte greek letters
-            20..=32 => char::from_u32(self.rng.gen_range(('α' as u32)..('ω' as u32 + 1))),
-            // // three-byte characters
-            33..=45 => ['✋', '✅', '❌', '❎', '⭐']
-                .choose(&mut self.rng)
-                .copied(),
-            // // four-byte characters
-            46..=58 => ['🍐', '🏀', '🍗', '🎉'].choose(&mut self.rng).copied(),
-            // ascii letters
-            _ => Some(self.rng.gen_range(b'a'..b'z' + 1).into()),
+            match self.rng.gen_range(0..100) {
+                // whitespace
+                0..=19 => [' ', '\n', '\r', '\t'].choose(&mut self.rng).copied(),
+                // two-byte greek letters
+                20..=32 => char::from_u32(self.rng.gen_range(('α' as u32)..('ω' as u32 + 1))),
+                // // three-byte characters
+                33..=45 => ['✋', '✅', '❌', '❎', '⭐']
+                    .choose(&mut self.rng)
+                    .copied(),
+                // // four-byte characters
+                46..=58 => ['🍐', '🏀', '🍗', '🎉'].choose(&mut self.rng).copied(),
+                // ascii letters
+                _ => Some(self.rng.gen_range(b'a'..b'z' + 1).into()),
+            }
         }
     }
 }
-
+#[cfg(any(test, feature = "test-support"))]
+pub use rng::RandomCharIter;
 /// Get an embedded file as a string.
 pub fn asset_str<A: rust_embed::RustEmbed>(path: &str) -> Cow<'static, str> {
     match A::get(path).unwrap().data {
@@ -639,27 +519,34 @@ impl<T: Ord + Clone> RangeExt<T> for RangeInclusive<T> {
 /// This is useful for turning regular alphanumerically sorted sequences as `1-abc, 10, 11-def, .., 2, 21-abc`
 /// into `1-abc, 2, 10, 11-def, .., 21-abc`
 #[derive(Debug, PartialEq, Eq)]
-pub struct NumericPrefixWithSuffix<'a>(i32, &'a str);
+pub struct NumericPrefixWithSuffix<'a>(Option<u64>, &'a str);
 
 impl<'a> NumericPrefixWithSuffix<'a> {
-    pub fn from_numeric_prefixed_str(str: &'a str) -> Option<Self> {
+    pub fn from_numeric_prefixed_str(str: &'a str) -> Self {
         let i = str.chars().take_while(|c| c.is_ascii_digit()).count();
         let (prefix, remainder) = str.split_at(i);
 
-        match prefix.parse::<i32>() {
-            Ok(prefix) => Some(NumericPrefixWithSuffix(prefix, remainder)),
-            Err(_) => None,
-        }
+        let prefix = prefix.parse().ok();
+        Self(prefix, remainder)
     }
 }
 
+/// When dealing with equality, we need to consider the case of the strings to achieve strict equality
+/// to handle cases like "a" < "A" instead of "a" == "A".
 impl Ord for NumericPrefixWithSuffix<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
-        let NumericPrefixWithSuffix(num_a, remainder_a) = self;
-        let NumericPrefixWithSuffix(num_b, remainder_b) = other;
-        num_a
-            .cmp(num_b)
-            .then_with(|| UniCase::new(remainder_a).cmp(&UniCase::new(remainder_b)))
+        match (self.0, other.0) {
+            (None, None) => UniCase::new(self.1)
+                .cmp(&UniCase::new(other.1))
+                .then_with(|| self.1.cmp(other.1).reverse()),
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(a), Some(b)) => a.cmp(&b).then_with(|| {
+                UniCase::new(self.1)
+                    .cmp(&UniCase::new(other.1))
+                    .then_with(|| self.1.cmp(other.1).reverse())
+            }),
+        }
     }
 }
 
@@ -720,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trancate_and_trailoff() {
+    fn test_truncate_and_trailoff() {
         assert_eq!(truncate_and_trailoff("", 5), "");
         assert_eq!(truncate_and_trailoff("èèèèèè", 7), "èèèèèè");
         assert_eq!(truncate_and_trailoff("èèèèèè", 6), "èèèèèè");
@@ -732,66 +619,62 @@ mod tests {
         let target = "1a";
         assert_eq!(
             NumericPrefixWithSuffix::from_numeric_prefixed_str(target),
-            Some(NumericPrefixWithSuffix(1, "a"))
+            NumericPrefixWithSuffix(Some(1), "a")
         );
 
         let target = "12ab";
         assert_eq!(
             NumericPrefixWithSuffix::from_numeric_prefixed_str(target),
-            Some(NumericPrefixWithSuffix(12, "ab"))
+            NumericPrefixWithSuffix(Some(12), "ab")
         );
 
         let target = "12_ab";
         assert_eq!(
             NumericPrefixWithSuffix::from_numeric_prefixed_str(target),
-            Some(NumericPrefixWithSuffix(12, "_ab"))
+            NumericPrefixWithSuffix(Some(12), "_ab")
         );
 
         let target = "1_2ab";
         assert_eq!(
             NumericPrefixWithSuffix::from_numeric_prefixed_str(target),
-            Some(NumericPrefixWithSuffix(1, "_2ab"))
+            NumericPrefixWithSuffix(Some(1), "_2ab")
         );
 
         let target = "1.2";
         assert_eq!(
             NumericPrefixWithSuffix::from_numeric_prefixed_str(target),
-            Some(NumericPrefixWithSuffix(1, ".2"))
+            NumericPrefixWithSuffix(Some(1), ".2")
         );
 
         let target = "1.2_a";
         assert_eq!(
             NumericPrefixWithSuffix::from_numeric_prefixed_str(target),
-            Some(NumericPrefixWithSuffix(1, ".2_a"))
+            NumericPrefixWithSuffix(Some(1), ".2_a")
         );
 
         let target = "12.2_a";
         assert_eq!(
             NumericPrefixWithSuffix::from_numeric_prefixed_str(target),
-            Some(NumericPrefixWithSuffix(12, ".2_a"))
+            NumericPrefixWithSuffix(Some(12), ".2_a")
         );
 
         let target = "12a.2_a";
         assert_eq!(
             NumericPrefixWithSuffix::from_numeric_prefixed_str(target),
-            Some(NumericPrefixWithSuffix(12, "a.2_a"))
+            NumericPrefixWithSuffix(Some(12), "a.2_a")
         );
     }
 
     #[test]
     fn test_numeric_prefix_with_suffix() {
         let mut sorted = vec!["1-abc", "10", "11def", "2", "21-abc"];
-        sorted.sort_by_key(|s| {
-            NumericPrefixWithSuffix::from_numeric_prefixed_str(s).unwrap_or_else(|| {
-                panic!("Cannot convert string `{s}` into NumericPrefixWithSuffix")
-            })
-        });
+        sorted.sort_by_key(|s| NumericPrefixWithSuffix::from_numeric_prefixed_str(s));
         assert_eq!(sorted, ["1-abc", "2", "10", "11def", "21-abc"]);
 
         for numeric_prefix_less in ["numeric_prefix_less", "aaa", "~™£"] {
             assert_eq!(
                 NumericPrefixWithSuffix::from_numeric_prefixed_str(numeric_prefix_less),
-                None,
+                NumericPrefixWithSuffix(None, numeric_prefix_less),
                 "String without numeric prefix `{numeric_prefix_less}` should not be converted into NumericPrefixWithSuffix"
             )
         }

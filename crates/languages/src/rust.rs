@@ -1,85 +1,111 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_compression::futures::bufread::GzipDecoder;
 use async_trait::async_trait;
+use collections::HashMap;
 use futures::{io::BufReader, StreamExt};
-use gpui::{AppContext, AsyncAppContext};
+use gpui::{AppContext, AsyncAppContext, Task};
+use http_client::github::AssetKind;
 use http_client::github::{latest_github_release, GitHubLspBinaryVersion};
 pub use language::*;
-use language_settings::all_language_settings;
-use lazy_static::lazy_static;
-use lsp::LanguageServerBinary;
-use project::project_settings::{BinarySettings, ProjectSettings};
+use lsp::{LanguageServerBinary, LanguageServerName};
 use regex::Regex;
-use settings::Settings;
-use smol::fs::{self, File};
+use smol::fs::{self};
 use std::{
     any::Any,
     borrow::Cow,
-    env::consts,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 use task::{TaskTemplate, TaskTemplates, TaskVariables, VariableName};
 use util::{fs::remove_matching, maybe, ResultExt};
 
+use crate::language_settings::language_settings;
+
 pub struct RustLspAdapter;
 
+#[cfg(target_os = "macos")]
 impl RustLspAdapter {
-    const SERVER_NAME: &'static str = "rust-analyzer";
+    const GITHUB_ASSET_KIND: AssetKind = AssetKind::Gz;
+    const ARCH_SERVER_NAME: &str = "apple-darwin";
+}
+
+#[cfg(target_os = "linux")]
+impl RustLspAdapter {
+    const GITHUB_ASSET_KIND: AssetKind = AssetKind::Gz;
+    const ARCH_SERVER_NAME: &str = "unknown-linux-gnu";
+}
+
+#[cfg(target_os = "freebsd")]
+impl RustLspAdapter {
+    const GITHUB_ASSET_KIND: AssetKind = AssetKind::Gz;
+    const ARCH_SERVER_NAME: &str = "unknown-freebsd";
+}
+
+#[cfg(target_os = "windows")]
+impl RustLspAdapter {
+    const GITHUB_ASSET_KIND: AssetKind = AssetKind::Zip;
+    const ARCH_SERVER_NAME: &str = "pc-windows-msvc";
+}
+
+impl RustLspAdapter {
+    const SERVER_NAME: LanguageServerName = LanguageServerName::new_static("rust-analyzer");
+
+    fn build_asset_name() -> String {
+        let extension = match Self::GITHUB_ASSET_KIND {
+            AssetKind::TarGz => "tar.gz",
+            AssetKind::Gz => "gz",
+            AssetKind::Zip => "zip",
+        };
+
+        format!(
+            "{}-{}-{}.{}",
+            Self::SERVER_NAME,
+            std::env::consts::ARCH,
+            Self::ARCH_SERVER_NAME,
+            extension
+        )
+    }
 }
 
 #[async_trait(?Send)]
 impl LspAdapter for RustLspAdapter {
     fn name(&self) -> LanguageServerName {
-        LanguageServerName(Self::SERVER_NAME.into())
+        Self::SERVER_NAME.clone()
     }
 
     async fn check_if_user_installed(
         &self,
         delegate: &dyn LspAdapterDelegate,
-        cx: &AsyncAppContext,
+        _: Arc<dyn LanguageToolchainStore>,
+        _: &AsyncAppContext,
     ) -> Option<LanguageServerBinary> {
-        let configured_binary = cx.update(|cx| {
-            ProjectSettings::get_global(cx)
-                .lsp
-                .get(Self::SERVER_NAME)
-                .and_then(|s| s.binary.clone())
-        });
+        let path = delegate.which("rust-analyzer".as_ref()).await?;
+        let env = delegate.shell_env().await;
 
-        match configured_binary {
-            Ok(Some(BinarySettings {
+        // It is surprisingly common for ~/.cargo/bin/rust-analyzer to be a symlink to
+        // /usr/bin/rust-analyzer that fails when you run it; so we need to test it.
+        log::info!("found rust-analyzer in PATH. trying to run `rust-analyzer --help`");
+        let result = delegate
+            .try_exec(LanguageServerBinary {
+                path: path.clone(),
+                arguments: vec!["--help".into()],
+                env: Some(env.clone()),
+            })
+            .await;
+        if let Err(err) = result {
+            log::error!(
+                "failed to run rust-analyzer after detecting it in PATH: binary: {:?}: {}",
                 path,
-                arguments,
-                path_lookup,
-            })) => {
-                let (path, env) = match (path, path_lookup) {
-                    (Some(path), lookup) => {
-                        if lookup.is_some() {
-                            log::warn!(
-                                "Both `path` and `path_lookup` are set, ignoring `path_lookup`"
-                            );
-                        }
-                        (Some(path.into()), None)
-                    }
-                    (None, Some(true)) => {
-                        let path = delegate.which(Self::SERVER_NAME.as_ref()).await?;
-                        let env = delegate.shell_env().await;
-                        (Some(path), Some(env))
-                    }
-                    (None, Some(false)) | (None, None) => (None, None),
-                };
-                path.map(|path| LanguageServerBinary {
-                    path,
-                    arguments: arguments
-                        .unwrap_or_default()
-                        .iter()
-                        .map(|arg| arg.into())
-                        .collect(),
-                    env,
-                })
-            }
-            _ => None,
+                err
+            );
+            return None;
         }
+
+        Some(LanguageServerBinary {
+            path,
+            env: Some(env),
+            arguments: vec![],
+        })
     }
 
     async fn fetch_latest_server_version(
@@ -93,13 +119,8 @@ impl LspAdapter for RustLspAdapter {
             delegate.http_client(),
         )
         .await?;
-        let os = match consts::OS {
-            "macos" => "apple-darwin",
-            "linux" => "unknown-linux-gnu",
-            "windows" => "pc-windows-msvc",
-            other => bail!("Running on unsupported os: {other}"),
-        };
-        let asset_name = format!("rust-analyzer-{}-{os}.gz", consts::ARCH);
+        let asset_name = Self::build_asset_name();
+
         let asset = release
             .assets
             .iter()
@@ -119,31 +140,68 @@ impl LspAdapter for RustLspAdapter {
     ) -> Result<LanguageServerBinary> {
         let version = version.downcast::<GitHubLspBinaryVersion>().unwrap();
         let destination_path = container_dir.join(format!("rust-analyzer-{}", version.name));
+        let server_path = match Self::GITHUB_ASSET_KIND {
+            AssetKind::TarGz | AssetKind::Gz => destination_path.clone(), // Tar and gzip extract in place.
+            AssetKind::Zip => destination_path.clone().join("rust-analyzer.exe"), // zip contains a .exe
+        };
 
-        if fs::metadata(&destination_path).await.is_err() {
+        if fs::metadata(&server_path).await.is_err() {
+            remove_matching(&container_dir, |entry| entry != destination_path).await;
+
             let mut response = delegate
                 .http_client()
                 .get(&version.url, Default::default(), true)
                 .await
-                .map_err(|err| anyhow!("error downloading release: {}", err))?;
-            let decompressed_bytes = GzipDecoder::new(BufReader::new(response.body_mut()));
-            let mut file = File::create(&destination_path).await?;
-            futures::io::copy(decompressed_bytes, &mut file).await?;
+                .with_context(|| format!("downloading release from {}", version.url))?;
+            match Self::GITHUB_ASSET_KIND {
+                AssetKind::TarGz => {
+                    let decompressed_bytes = GzipDecoder::new(BufReader::new(response.body_mut()));
+                    let archive = async_tar::Archive::new(decompressed_bytes);
+                    archive.unpack(&destination_path).await.with_context(|| {
+                        format!("extracting {} to {:?}", version.url, destination_path)
+                    })?;
+                }
+                AssetKind::Gz => {
+                    let mut decompressed_bytes =
+                        GzipDecoder::new(BufReader::new(response.body_mut()));
+                    let mut file =
+                        fs::File::create(&destination_path).await.with_context(|| {
+                            format!(
+                                "creating a file {:?} for a download from {}",
+                                destination_path, version.url,
+                            )
+                        })?;
+                    futures::io::copy(&mut decompressed_bytes, &mut file)
+                        .await
+                        .with_context(|| {
+                            format!("extracting {} to {:?}", version.url, destination_path)
+                        })?;
+                }
+                AssetKind::Zip => {
+                    node_runtime::extract_zip(
+                        &destination_path,
+                        BufReader::new(response.body_mut()),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("unzipping {} to {:?}", version.url, destination_path)
+                    })?;
+                }
+            };
+
             // todo("windows")
             #[cfg(not(windows))]
             {
                 fs::set_permissions(
-                    &destination_path,
+                    &server_path,
                     <fs::Permissions as fs::unix::PermissionsExt>::from_mode(0o755),
                 )
                 .await?;
             }
-
-            remove_matching(&container_dir, |entry| entry != destination_path).await;
         }
 
         Ok(LanguageServerBinary {
-            path: destination_path,
+            path: server_path,
             env: None,
             arguments: Default::default(),
         })
@@ -157,18 +215,6 @@ impl LspAdapter for RustLspAdapter {
         get_cached_server_binary(container_dir).await
     }
 
-    async fn installation_test_binary(
-        &self,
-        container_dir: PathBuf,
-    ) -> Option<LanguageServerBinary> {
-        get_cached_server_binary(container_dir)
-            .await
-            .map(|mut binary| {
-                binary.arguments = vec!["--help".into()];
-                binary
-            })
-    }
-
     fn disk_based_diagnostic_sources(&self) -> Vec<String> {
         vec!["rustc".into()]
     }
@@ -178,9 +224,8 @@ impl LspAdapter for RustLspAdapter {
     }
 
     fn process_diagnostics(&self, params: &mut lsp::PublishDiagnosticsParams) {
-        lazy_static! {
-            static ref REGEX: Regex = Regex::new("(?m)`([^`]+)\n`$").unwrap();
-        }
+        static REGEX: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?m)`([^`]+)\n`$").expect("Failed to create REGEX"));
 
         for diagnostic in &mut params.diagnostics {
             for message in diagnostic
@@ -231,7 +276,11 @@ impl LspAdapter for RustLspAdapter {
                     && completion.insert_text_format != Some(lsp::InsertTextFormat::SNIPPET) =>
             {
                 let name = &completion.label;
-                let text = format!("{}: {}", name, detail.unwrap());
+                let text = format!(
+                    "{}: {}",
+                    name,
+                    completion.detail.as_ref().or(detail.as_ref()).unwrap()
+                );
                 let source = Rope::from(format!("let {} = ();", text).as_str());
                 let runs = language.highlight_text(&source, 4..4 + text.len());
                 return Some(CodeLabel {
@@ -243,11 +292,10 @@ impl LspAdapter for RustLspAdapter {
             Some(lsp::CompletionItemKind::FUNCTION | lsp::CompletionItemKind::METHOD)
                 if detail.is_some() =>
             {
-                lazy_static! {
-                    static ref REGEX: Regex = Regex::new("\\(…?\\)").unwrap();
-                }
+                static REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new("\\(…?\\)").unwrap());
+
                 let detail = detail.unwrap();
-                const FUNCTION_PREFIXES: [&'static str; 6] = [
+                const FUNCTION_PREFIXES: [&str; 6] = [
                     "async fn",
                     "async unsafe fn",
                     "const fn",
@@ -265,19 +313,32 @@ impl LspAdapter for RustLspAdapter {
                 });
                 // fn keyword should be followed by opening parenthesis.
                 if let Some((prefix, suffix)) = fn_keyword {
+                    let mut text = REGEX.replace(&completion.label, suffix).to_string();
+                    let source = Rope::from(format!("{prefix} {} {{}}", text).as_str());
+                    let run_start = prefix.len() + 1;
+                    let runs = language.highlight_text(&source, run_start..run_start + text.len());
                     if detail.starts_with(" (") {
-                        let mut text = REGEX.replace(&completion.label, suffix).to_string();
-                        let source = Rope::from(format!("{prefix} {} {{}}", text).as_str());
-                        let run_start = prefix.len() + 1;
-                        let runs =
-                            language.highlight_text(&source, run_start..run_start + text.len());
                         text.push_str(&detail);
-                        return Some(CodeLabel {
-                            filter_range: 0..completion.label.find('(').unwrap_or(text.len()),
-                            text,
-                            runs,
-                        });
                     }
+
+                    return Some(CodeLabel {
+                        filter_range: 0..completion.label.find('(').unwrap_or(text.len()),
+                        text,
+                        runs,
+                    });
+                } else if completion
+                    .detail
+                    .as_ref()
+                    .map_or(false, |detail| detail.starts_with("macro_rules! "))
+                {
+                    let source = Rope::from(completion.label.as_str());
+                    let runs = language.highlight_text(&source, 0..completion.label.len());
+
+                    return Some(CodeLabel {
+                        filter_range: 0..completion.label.len(),
+                        text: completion.label.clone(),
+                        runs,
+                    });
                 }
             }
             Some(kind) => {
@@ -391,8 +452,10 @@ impl ContextProvider for RustContextProvider {
         &self,
         task_variables: &TaskVariables,
         location: &Location,
+        project_env: Option<HashMap<String, String>>,
+        _: Arc<dyn LanguageToolchainStore>,
         cx: &mut gpui::AppContext,
-    ) -> Result<TaskVariables> {
+    ) -> Task<Result<TaskVariables>> {
         let local_abs_path = location
             .buffer
             .read(cx)
@@ -406,27 +469,27 @@ impl ContextProvider for RustContextProvider {
             .is_some();
 
         if is_main_function {
-            if let Some((package_name, bin_name)) = local_abs_path
-                .and_then(|local_abs_path| package_name_and_bin_name_from_abs_path(local_abs_path))
-            {
-                return Ok(TaskVariables::from_iter([
+            if let Some((package_name, bin_name)) = local_abs_path.and_then(|path| {
+                package_name_and_bin_name_from_abs_path(path, project_env.as_ref())
+            }) {
+                return Task::ready(Ok(TaskVariables::from_iter([
                     (RUST_PACKAGE_TASK_VARIABLE.clone(), package_name),
                     (RUST_BIN_NAME_TASK_VARIABLE.clone(), bin_name),
-                ]));
+                ])));
             }
         }
 
         if let Some(package_name) = local_abs_path
             .and_then(|local_abs_path| local_abs_path.parent())
-            .and_then(human_readable_package_name)
+            .and_then(|path| human_readable_package_name(path, project_env.as_ref()))
         {
-            return Ok(TaskVariables::from_iter([(
+            return Task::ready(Ok(TaskVariables::from_iter([(
                 RUST_PACKAGE_TASK_VARIABLE.clone(),
                 package_name,
-            )]));
+            )])));
         }
 
-        Ok(TaskVariables::default())
+        Task::ready(Ok(TaskVariables::default()))
     }
 
     fn associated_tasks(
@@ -434,14 +497,14 @@ impl ContextProvider for RustContextProvider {
         file: Option<Arc<dyn language::File>>,
         cx: &AppContext,
     ) -> Option<TaskTemplates> {
-        const DEFAULT_RUN_NAME_STR: &'static str = "RUST_DEFAULT_PACKAGE_RUN";
-        let package_to_run = all_language_settings(file.as_ref(), cx)
-            .language(Some("Rust"))
+        const DEFAULT_RUN_NAME_STR: &str = "RUST_DEFAULT_PACKAGE_RUN";
+        let package_to_run = language_settings(Some("Rust".into()), file.as_ref(), cx)
             .tasks
             .variables
-            .get(DEFAULT_RUN_NAME_STR);
+            .get(DEFAULT_RUN_NAME_STR)
+            .cloned();
         let run_task_args = if let Some(package_to_run) = package_to_run {
-            vec!["run".into(), "-p".into(), package_to_run.clone()]
+            vec!["run".into(), "-p".into(), package_to_run]
         } else {
             vec!["run".into()]
         };
@@ -572,8 +635,15 @@ struct CargoTarget {
     src_path: String,
 }
 
-fn package_name_and_bin_name_from_abs_path(abs_path: &Path) -> Option<(String, String)> {
-    let output = std::process::Command::new("cargo")
+fn package_name_and_bin_name_from_abs_path(
+    abs_path: &Path,
+    project_env: Option<&HashMap<String, String>>,
+) -> Option<(String, String)> {
+    let mut command = util::command::new_std_command("cargo");
+    if let Some(envs) = project_env {
+        command.envs(envs);
+    }
+    let output = command
         .current_dir(abs_path.parent()?)
         .arg("metadata")
         .arg("--no-deps")
@@ -611,9 +681,16 @@ fn retrieve_package_id_and_bin_name_from_metadata(
     None
 }
 
-fn human_readable_package_name(package_directory: &Path) -> Option<String> {
+fn human_readable_package_name(
+    package_directory: &Path,
+    project_env: Option<&HashMap<String, String>>,
+) -> Option<String> {
+    let mut command = util::command::new_std_command("cargo");
+    if let Some(envs) = project_env {
+        command.envs(envs);
+    }
     let pkgid = String::from_utf8(
-        std::process::Command::new("cargo")
+        command
             .current_dir(package_directory)
             .arg("pkgid")
             .output()
@@ -626,7 +703,7 @@ fn human_readable_package_name(package_directory: &Path) -> Option<String> {
 
 // For providing local `cargo check -p $pkgid` task, we do not need most of the information we have returned.
 // Output example in the root of Zed project:
-// ```bash
+// ```sh
 // ❯ cargo pkgid zed
 // path+file:///absolute/path/to/project/zed/crates/zed#0.131.0
 // ```
@@ -731,7 +808,7 @@ mod tests {
     #[gpui::test]
     async fn test_rust_label_for_completion() {
         let adapter = Arc::new(RustLspAdapter);
-        let language = language("rust", tree_sitter_rust::language());
+        let language = language("rust", tree_sitter_rust::LANGUAGE.into());
         let grammar = language.grammar().unwrap();
         let theme = SyntaxTheme::new_test([
             ("type", Hsla::default()),
@@ -856,7 +933,7 @@ mod tests {
     #[gpui::test]
     async fn test_rust_label_for_symbol() {
         let adapter = Arc::new(RustLspAdapter);
-        let language = language("rust", tree_sitter_rust::language());
+        let language = language("rust", tree_sitter_rust::LANGUAGE.into());
         let grammar = language.grammar().unwrap();
         let theme = SyntaxTheme::new_test([
             ("type", Hsla::default()),
@@ -908,7 +985,7 @@ mod tests {
             });
         });
 
-        let language = crate::language("rust", tree_sitter_rust::language());
+        let language = crate::language("rust", tree_sitter_rust::LANGUAGE.into());
 
         cx.new_model(|cx| {
             let mut buffer = Buffer::local("", cx).with_language(language, cx);

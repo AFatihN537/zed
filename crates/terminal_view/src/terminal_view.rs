@@ -19,12 +19,13 @@ use terminal::{
         index::Point,
         term::{search::RegexSearch, TermMode},
     },
-    terminal_settings::{TerminalBlink, TerminalSettings, WorkingDirectory},
+    terminal_settings::{CursorShape, TerminalBlink, TerminalSettings, WorkingDirectory},
     Clear, Copy, Event, MaybeNavigationTarget, Paste, ScrollLineDown, ScrollLineUp, ScrollPageDown,
     ScrollPageUp, ScrollToBottom, ScrollToTop, ShowCharacterPalette, TaskStatus, Terminal,
-    TerminalSize,
+    TerminalSize, ToggleViMode,
 };
 use terminal_element::{is_blank, TerminalElement};
+use terminal_panel::TerminalPanel;
 use ui::{h_flex, prelude::*, ContextMenu, Icon, IconName, Label, Tooltip};
 use util::{paths::PathWithPosition, ResultExt};
 use workspace::{
@@ -32,14 +33,15 @@ use workspace::{
     notifications::NotifyResultExt,
     register_serializable_item,
     searchable::{SearchEvent, SearchOptions, SearchableItem, SearchableItemHandle},
-    CloseActiveItem, NewCenterTerminal, NewTerminal, OpenVisible, Pane, ToolbarItemLocation,
-    Workspace, WorkspaceId,
+    CloseActiveItem, NewCenterTerminal, NewTerminal, OpenVisible, ToolbarItemLocation, Workspace,
+    WorkspaceId,
 };
 
 use anyhow::Context;
 use serde::Deserialize;
 use settings::{Settings, SettingsStore};
 use smol::Timer;
+use zed_actions::InlineAssist;
 
 use std::{
     cmp,
@@ -55,6 +57,8 @@ const REGEX_SPECIAL_CHARS: &[char] = &[
 ];
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+
+const GIT_DIFF_PATH_PREFIXES: &[char] = &['a', 'b'];
 
 ///Event to transmit the scroll from the element to the view
 #[derive(Clone, Debug, PartialEq)]
@@ -98,13 +102,14 @@ pub struct TerminalView {
     //Currently using iTerm bell, show bell emoji in tab until input is received
     has_bell: bool,
     context_menu: Option<(View<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
+    cursor_shape: CursorShape,
     blink_state: bool,
-    blinking_on: bool,
+    blinking_terminal_enabled: bool,
     blinking_paused: bool,
     blink_epoch: usize,
     can_navigate_to_selected_word: bool,
     workspace_id: Option<WorkspaceId>,
-    show_title: bool,
+    show_breadcrumbs: bool,
     block_below_cursor: Option<Rc<BlockProperties>>,
     scroll_top: Pixels,
     _subscriptions: Vec<Subscription>,
@@ -167,6 +172,9 @@ impl TerminalView {
         let focus_out = cx.on_focus_out(&focus_handle, |terminal_view, _event, cx| {
             terminal_view.focus_out(cx);
         });
+        let cursor_shape = TerminalSettings::get_global(cx)
+            .cursor_shape
+            .unwrap_or_default();
 
         Self {
             terminal,
@@ -174,13 +182,14 @@ impl TerminalView {
             has_bell: false,
             focus_handle,
             context_menu: None,
+            cursor_shape,
             blink_state: true,
-            blinking_on: false,
+            blinking_terminal_enabled: false,
             blinking_paused: false,
             blink_epoch: 0,
             can_navigate_to_selected_word: false,
             workspace_id,
-            show_title: TerminalSettings::get_global(cx).toolbar.title,
+            show_breadcrumbs: TerminalSettings::get_global(cx).toolbar.breadcrumbs,
             block_below_cursor: None,
             scroll_top: Pixels::ZERO,
             _subscriptions: vec![
@@ -210,13 +219,25 @@ impl TerminalView {
         position: gpui::Point<Pixels>,
         cx: &mut ViewContext<Self>,
     ) {
+        let assistant_enabled = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).panel::<TerminalPanel>(cx))
+            .map_or(false, |terminal_panel| {
+                terminal_panel.read(cx).assistant_enabled()
+            });
         let context_menu = ContextMenu::build(cx, |menu, _| {
-            menu.action("New Terminal", Box::new(NewTerminal))
+            menu.context(self.focus_handle.clone())
+                .action("New Terminal", Box::new(NewTerminal))
                 .separator()
                 .action("Copy", Box::new(Copy))
                 .action("Paste", Box::new(Paste))
                 .action("Select All", Box::new(SelectAll))
                 .action("Clear", Box::new(Clear))
+                .when(assistant_enabled, |menu| {
+                    menu.separator()
+                        .action("Inline Assist", Box::new(InlineAssist::default()))
+                })
                 .separator()
                 .action("Close", Box::new(CloseActiveItem { save_intent: None }))
         });
@@ -238,7 +259,17 @@ impl TerminalView {
 
     fn settings_changed(&mut self, cx: &mut ViewContext<Self>) {
         let settings = TerminalSettings::get_global(cx);
-        self.show_title = settings.toolbar.title;
+        self.show_breadcrumbs = settings.toolbar.breadcrumbs;
+
+        let new_cursor_shape = settings.cursor_shape.unwrap_or_default();
+        let old_cursor_shape = self.cursor_shape;
+        if old_cursor_shape != new_cursor_shape {
+            self.cursor_shape = new_cursor_shape;
+            self.terminal.update(cx, |term, _| {
+                term.set_cursor_shape(self.cursor_shape);
+            });
+        }
+
         cx.notify();
     }
 
@@ -400,10 +431,14 @@ impl TerminalView {
         cx.notify();
     }
 
+    fn toggle_vi_mode(&mut self, _: &ToggleViMode, cx: &mut ViewContext<Self>) {
+        self.terminal.update(cx, |term, _| term.toggle_vi_mode());
+        cx.notify();
+    }
+
     pub fn should_show_cursor(&self, focused: bool, cx: &mut gpui::ViewContext<Self>) -> bool {
         //Don't blink the cursor when not focused, blinking is disabled, or paused
         if !focused
-            || !self.blinking_on
             || self.blinking_paused
             || self
                 .terminal
@@ -419,7 +454,10 @@ impl TerminalView {
             //If the user requested to never blink, don't blink it.
             TerminalBlink::Off => true,
             //If the terminal is controlling it, check terminal mode
-            TerminalBlink::TerminalControlled | TerminalBlink::On => self.blink_state,
+            TerminalBlink::TerminalControlled => {
+                !self.blinking_terminal_enabled || self.blink_state
+            }
+            TerminalBlink::On => self.blink_state,
         }
     }
 
@@ -487,9 +525,9 @@ impl TerminalView {
 
     ///Attempt to paste the clipboard into the terminal
     fn paste(&mut self, _: &Paste, cx: &mut ViewContext<Self>) {
-        if let Some(item) = cx.read_from_clipboard() {
+        if let Some(clipboard_string) = cx.read_from_clipboard().and_then(|item| item.text()) {
             self.terminal
-                .update(cx, |terminal, _cx| terminal.paste(item.text()));
+                .update(cx, |terminal, _cx| terminal.paste(&clipboard_string));
         }
     }
 
@@ -611,7 +649,14 @@ fn subscribe_for_terminal_events(
                 cx.emit(Event::Wakeup);
             }
 
-            Event::BlinkChanged => this.blinking_on = !this.blinking_on,
+            Event::BlinkChanged(blinking) => {
+                if matches!(
+                    TerminalSettings::get_global(cx).blinking,
+                    TerminalBlink::TerminalControlled
+                ) {
+                    this.blinking_terminal_enabled = *blinking;
+                }
+            }
 
             Event::TitleChanged => {
                 cx.emit(ItemEvent::UpdateTab);
@@ -631,7 +676,7 @@ fn subscribe_for_terminal_events(
                                 &path_like_target.maybe_path,
                                 cx,
                             );
-                            smol::block_on(valid_files_to_open_task).len() > 0
+                            !smol::block_on(valid_files_to_open_task).is_empty()
                         } else {
                             false
                         }
@@ -735,7 +780,10 @@ fn subscribe_for_terminal_events(
             },
             Event::BreadcrumbsChanged => cx.emit(ItemEvent::UpdateBreadcrumbs),
             Event::CloseTerminal => cx.emit(ItemEvent::CloseItem),
-            Event::SelectionsChanged => cx.emit(SearchEvent::ActiveMatchChanged),
+            Event::SelectionsChanged => {
+                cx.invalidate_character_coordinates();
+                cx.emit(SearchEvent::ActiveMatchChanged)
+            }
         });
     vec![terminal_subscription, terminal_events_subscription]
 }
@@ -786,23 +834,20 @@ fn possible_open_targets(
     let row = path_position.row;
     let column = path_position.column;
     let maybe_path = path_position.path;
-    let potential_abs_paths = if maybe_path.is_absolute() {
-        HashSet::from_iter([maybe_path])
+
+    let abs_path = if maybe_path.is_absolute() {
+        Some(maybe_path)
     } else if maybe_path.starts_with("~") {
-        if let Some(abs_path) = maybe_path
+        maybe_path
             .strip_prefix("~")
             .ok()
             .and_then(|maybe_path| Some(dirs::home_dir()?.join(maybe_path)))
-        {
-            HashSet::from_iter([abs_path])
-        } else {
-            HashSet::default()
-        }
     } else {
-        // First check cwd and then workspace
         let mut potential_cwd_and_workspace_paths = HashSet::default();
         if let Some(cwd) = cwd {
-            potential_cwd_and_workspace_paths.insert(Path::join(cwd, &maybe_path));
+            let abs_path = Path::join(cwd, &maybe_path);
+            let canonicalized_path = abs_path.canonicalize().unwrap_or(abs_path);
+            potential_cwd_and_workspace_paths.insert(canonicalized_path);
         }
         if let Some(workspace) = workspace.upgrade() {
             workspace.update(cx, |workspace, cx| {
@@ -812,12 +857,40 @@ fn possible_open_targets(
                 {
                     potential_cwd_and_workspace_paths.insert(potential_worktree_path);
                 }
+
+                for prefix in GIT_DIFF_PATH_PREFIXES {
+                    let prefix_str = &prefix.to_string();
+                    if maybe_path.starts_with(prefix_str) {
+                        let stripped = maybe_path.strip_prefix(prefix_str).unwrap_or(&maybe_path);
+                        for potential_worktree_path in workspace
+                            .worktrees(cx)
+                            .map(|worktree| worktree.read(cx).abs_path().join(&stripped))
+                        {
+                            potential_cwd_and_workspace_paths.insert(potential_worktree_path);
+                        }
+                    }
+                }
             });
         }
-        potential_cwd_and_workspace_paths
+
+        return possible_open_paths_metadata(
+            fs,
+            row,
+            column,
+            potential_cwd_and_workspace_paths,
+            cx,
+        );
     };
 
-    possible_open_paths_metadata(fs, row, column, potential_abs_paths, cx)
+    let canonicalized_paths = match abs_path {
+        Some(abs_path) => match abs_path.canonicalize() {
+            Ok(path) => HashSet::from_iter([path]),
+            Err(_) => HashSet::default(),
+        },
+        None => HashSet::default(),
+    };
+
+    possible_open_paths_metadata(fs, row, column, canonicalized_paths, cx)
 }
 
 fn regex_to_literal(regex: &str) -> String {
@@ -838,7 +911,7 @@ pub fn regex_search_for_query(query: &project::search::SearchQuery) -> Option<Re
     if query == "." {
         return None;
     }
-    let searcher = RegexSearch::new(&query);
+    let searcher = RegexSearch::new(query);
     searcher.ok()
 }
 
@@ -859,14 +932,19 @@ impl TerminalView {
     }
 
     fn focus_in(&mut self, cx: &mut ViewContext<Self>) {
-        self.terminal.read(cx).focus_in();
+        self.terminal.update(cx, |terminal, _| {
+            terminal.set_cursor_shape(self.cursor_shape);
+            terminal.focus_in();
+        });
         self.blink_cursors(self.blink_epoch, cx);
+        cx.invalidate_character_coordinates();
         cx.notify();
     }
 
     fn focus_out(&mut self, cx: &mut ViewContext<Self>) {
         self.terminal.update(cx, |terminal, _| {
             terminal.focus_out();
+            terminal.set_cursor_shape(CursorShape::Hollow);
         });
         cx.notify();
     }
@@ -882,7 +960,7 @@ impl Render for TerminalView {
         div()
             .size_full()
             .relative()
-            .track_focus(&self.focus_handle)
+            .track_focus(&self.focus_handle(cx))
             .key_context(self.dispatch_context(cx))
             .on_action(cx.listener(TerminalView::send_text))
             .on_action(cx.listener(TerminalView::send_keystroke))
@@ -895,6 +973,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(TerminalView::scroll_page_down))
             .on_action(cx.listener(TerminalView::scroll_to_top))
             .on_action(cx.listener(TerminalView::scroll_to_bottom))
+            .on_action(cx.listener(TerminalView::toggle_vi_mode))
             .on_action(cx.listener(TerminalView::show_character_palette))
             .on_action(cx.listener(TerminalView::select_all))
             .on_key_down(cx.listener(Self::key_down))
@@ -942,26 +1021,37 @@ impl Item for TerminalView {
     fn tab_content(&self, params: TabContentParams, cx: &WindowContext) -> AnyElement {
         let terminal = self.terminal().read(cx);
         let title = terminal.title(true);
+        let rerun_button = |task_id: task::TaskId| {
+            IconButton::new("rerun-icon", IconName::Rerun)
+                .icon_size(IconSize::Small)
+                .size(ButtonSize::Compact)
+                .icon_color(Color::Default)
+                .shape(ui::IconButtonShape::Square)
+                .tooltip(|cx| Tooltip::text("Rerun task", cx))
+                .on_click(move |_, cx| {
+                    cx.dispatch_action(Box::new(zed_actions::Rerun {
+                        task_id: Some(task_id.0.clone()),
+                        allow_concurrent_runs: Some(true),
+                        use_new_terminal: Some(false),
+                        reevaluate_context: false,
+                    }));
+                })
+        };
 
         let (icon, icon_color, rerun_button) = match terminal.task() {
             Some(terminal_task) => match &terminal_task.status {
-                TaskStatus::Unknown => (IconName::ExclamationTriangle, Color::Warning, None),
-                TaskStatus::Running => (IconName::Play, Color::Disabled, None),
+                TaskStatus::Running => (
+                    IconName::Play,
+                    Color::Disabled,
+                    Some(rerun_button(terminal_task.id.clone())),
+                ),
+                TaskStatus::Unknown => (
+                    IconName::Warning,
+                    Color::Warning,
+                    Some(rerun_button(terminal_task.id.clone())),
+                ),
                 TaskStatus::Completed { success } => {
-                    let task_id = terminal_task.id.clone();
-                    let rerun_button = IconButton::new("rerun-icon", IconName::Rerun)
-                        .icon_size(IconSize::Small)
-                        .size(ButtonSize::Compact)
-                        .icon_color(Color::Default)
-                        .shape(ui::IconButtonShape::Square)
-                        .tooltip(|cx| Tooltip::text("Rerun task", cx))
-                        .on_click(move |_, cx| {
-                            cx.dispatch_action(Box::new(tasks_ui::Rerun {
-                                task_id: Some(task_id.clone()),
-                                ..Default::default()
-                            }));
-                        });
-
+                    let rerun_button = rerun_button(terminal_task.id.clone());
                     if *success {
                         (IconName::Check, Color::Success, Some(rerun_button))
                     } else {
@@ -973,7 +1063,7 @@ impl Item for TerminalView {
         };
 
         h_flex()
-            .gap_2()
+            .gap_1()
             .group("term-tab-icon")
             .child(
                 h_flex()
@@ -1032,12 +1122,16 @@ impl Item for TerminalView {
         false
     }
 
+    fn is_singleton(&self, _cx: &AppContext) -> bool {
+        true
+    }
+
     fn as_searchable(&self, handle: &View<Self>) -> Option<Box<dyn SearchableItemHandle>> {
         Some(Box::new(handle.clone()))
     }
 
-    fn breadcrumb_location(&self) -> ToolbarItemLocation {
-        if self.show_title {
+    fn breadcrumb_location(&self, cx: &AppContext) -> ToolbarItemLocation {
+        if self.show_breadcrumbs && !self.terminal().read(cx).breadcrumb_text.trim().is_empty() {
             ToolbarItemLocation::PrimaryLeft
         } else {
             ToolbarItemLocation::Hidden
@@ -1093,7 +1187,7 @@ impl SerializableItem for TerminalView {
             return None;
         }
 
-        if let Some((cwd, workspace_id)) = terminal.get_cwd().zip(self.workspace_id) {
+        if let Some((cwd, workspace_id)) = terminal.working_directory().zip(self.workspace_id) {
             Some(cx.background_executor().spawn(async move {
                 TERMINAL_DB
                     .save_working_directory(item_id, workspace_id, cwd)
@@ -1113,10 +1207,10 @@ impl SerializableItem for TerminalView {
         workspace: WeakView<Workspace>,
         workspace_id: workspace::WorkspaceId,
         item_id: workspace::ItemId,
-        cx: &mut ViewContext<Pane>,
+        cx: &mut WindowContext,
     ) -> Task<anyhow::Result<View<Self>>> {
         let window = cx.window_handle();
-        cx.spawn(|pane, mut cx| async move {
+        cx.spawn(|mut cx| async move {
             let cwd = cx
                 .update(|cx| {
                     let from_db = TERMINAL_DB
@@ -1140,7 +1234,7 @@ impl SerializableItem for TerminalView {
             let terminal = project.update(&mut cx, |project, cx| {
                 project.create_terminal(TerminalKind::Shell(cwd), window, cx)
             })??;
-            pane.update(&mut cx, |_, cx| {
+            cx.update(|cx| {
                 cx.new_view(|cx| TerminalView::new(terminal, workspace, Some(workspace_id), cx))
             })
         })
@@ -1204,12 +1298,13 @@ impl SearchableItem for TerminalView {
         let searcher = match &*query {
             SearchQuery::Text { .. } => regex_search_for_query(
                 &(SearchQuery::text(
-                    regex_to_literal(&query.as_str()),
+                    regex_to_literal(query.as_str()),
                     query.whole_word(),
                     query.case_sensitive(),
                     query.include_ignored(),
                     query.files_to_include().clone(),
                     query.files_to_exclude().clone(),
+                    None,
                 )
                 .unwrap()),
             ),
@@ -1233,7 +1328,7 @@ impl SearchableItem for TerminalView {
         // Selection head might have a value if there's a selection that isn't
         // associated with a match. Therefore, if there are no matches, we should
         // report None, no matter the state of the terminal
-        let res = if matches.len() > 0 {
+        let res = if !matches.is_empty() {
             if let Some(selection_head) = self.terminal().read(cx).selection_head {
                 // If selection head is contained in a match. Return that match
                 if let Some(ix) = matches
@@ -1361,7 +1456,7 @@ mod tests {
         });
     }
 
-    // Active entry with a work tree, worktree is a file -> home_dir()
+    // Active entry with a work tree, worktree is a file -> worktree_folder()
     #[gpui::test]
     async fn active_entry_worktree_is_file(cx: &mut TestAppContext) {
         let (project, workspace) = init_test(cx).await;
@@ -1377,7 +1472,7 @@ mod tests {
             assert!(active_entry.is_some());
 
             let res = default_working_directory(workspace, cx);
-            assert_eq!(res, None);
+            assert_eq!(res, Some((Path::new("/root1/")).to_path_buf()));
             let res = first_project_directory(workspace, cx);
             assert_eq!(res, Some((Path::new("/root1/")).to_path_buf()));
         });
