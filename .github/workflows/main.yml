@@ -1,6 +1,7 @@
 name: Build and Run Rust Project
 
-on: [push]
+on:
+  workflow_dispatch:
 
 jobs:
   build:
@@ -33,4 +34,4 @@ jobs:
       uses: actions/upload-artifact@v2
       with:
         name: build-artifacts
-        path: ./*
+        path: ./target/release
