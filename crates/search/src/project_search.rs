@@ -35,7 +35,7 @@ use std::{
 use theme::ThemeSettings;
 use ui::{
     h_flex, prelude::*, utils::SearchInputWidth, v_flex, Icon, IconButton, IconButtonShape,
-    IconName, KeyBinding, Label, LabelCommon, LabelSize, Selectable, Tooltip,
+    IconName, KeyBinding, Label, LabelCommon, LabelSize, Toggleable, Tooltip,
 };
 use util::paths::PathMatcher;
 use workspace::{
@@ -333,20 +333,20 @@ impl Render for ProjectSearchView {
             let model = self.model.read(cx);
             let has_no_results = model.no_results.unwrap_or(false);
             let is_search_underway = model.pending_search.is_some();
-            let major_text = if is_search_underway {
-                "Searching..."
+
+            let heading_text = if is_search_underway {
+                "Searching…"
             } else if has_no_results {
-                "No results"
+                "No Results"
             } else {
-                "Search all files"
+                "Search All Files"
             };
 
-            let major_text = div()
+            let heading_text = div()
                 .justify_center()
-                .max_w_96()
-                .child(Label::new(major_text).size(LabelSize::Large));
+                .child(Label::new(heading_text).size(LabelSize::Large));
 
-            let minor_text: Option<AnyElement> = if let Some(no_results) = model.no_results {
+            let page_content: Option<AnyElement> = if let Some(no_results) = model.no_results {
                 if model.pending_search.is_none() && no_results {
                     Some(
                         Label::new("No results found in this project for the provided query")
@@ -359,20 +359,24 @@ impl Render for ProjectSearchView {
             } else {
                 Some(self.landing_text_minor(cx).into_any_element())
             };
-            let minor_text = minor_text.map(|text| div().items_center().max_w_96().child(text));
+
+            let page_content = page_content.map(|text| div().child(text));
+
             v_flex()
-                .flex_1()
                 .size_full()
+                .items_center()
                 .justify_center()
+                .overflow_hidden()
                 .bg(cx.theme().colors().editor_background)
                 .track_focus(&self.focus_handle(cx))
                 .child(
-                    h_flex()
-                        .size_full()
-                        .justify_center()
-                        .child(h_flex().flex_1())
-                        .child(v_flex().gap_1().child(major_text).children(minor_text))
-                        .child(h_flex().flex_1()),
+                    v_flex()
+                        .id("project-search-landing-page")
+                        .overflow_y_scroll()
+                        .max_w_80()
+                        .gap_1()
+                        .child(heading_text)
+                        .children(page_content),
                 )
         }
     }
@@ -445,7 +449,7 @@ impl Item for ProjectSearchView {
     fn for_each_project_item(
         &self,
         cx: &AppContext,
-        f: &mut dyn FnMut(EntityId, &dyn project::Item),
+        f: &mut dyn FnMut(EntityId, &dyn project::ProjectItem),
     ) {
         self.results_editor.for_each_project_item(cx, f)
     }
@@ -1591,6 +1595,7 @@ impl Render for ProjectSearchBar {
 
         let input_base_styles = || {
             h_flex()
+                .min_w_32()
                 .w(input_width)
                 .h_8()
                 .px_2()
@@ -1640,7 +1645,7 @@ impl Render for ProjectSearchBar {
                     .on_click(cx.listener(|this, _, cx| {
                         this.toggle_filters(cx);
                     }))
-                    .selected(
+                    .toggle_state(
                         self.active_project_search
                             .as_ref()
                             .map(|search| search.read(cx).filters_enabled)
@@ -1664,7 +1669,7 @@ impl Render for ProjectSearchBar {
                     .on_click(cx.listener(|this, _, cx| {
                         this.toggle_replace(&ToggleReplace, cx);
                     }))
-                    .selected(
+                    .toggle_state(
                         self.active_project_search
                             .as_ref()
                             .map(|search| search.read(cx).replace_enabled)
@@ -1873,7 +1878,7 @@ impl Render for ProjectSearchBar {
                         .child(
                             IconButton::new("project-search-opened-only", IconName::FileSearch)
                                 .shape(IconButtonShape::Square)
-                                .selected(self.is_opened_only_enabled(cx))
+                                .toggle_state(self.is_opened_only_enabled(cx))
                                 .tooltip(|cx| Tooltip::text("Only Search Open Files", cx))
                                 .on_click(cx.listener(|this, _, cx| {
                                     this.toggle_opened_only(cx);
